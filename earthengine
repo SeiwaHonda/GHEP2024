@@ -1,0 +1,141 @@
+// Define the geometry for Bang Krachao
+var geometry = ee.Geometry.LinearRing([
+  [100.55765083027232, 13.705052063112982],
+  [100.56262901020396, 13.704718515127768],
+  [100.5811684389149, 13.696379661631703],
+  [100.58545997333873, 13.69271047237956],
+  [100.58803489399303, 13.6883740840008],
+  [100.58683326435435, 13.681202189347271],
+  [100.57138374042857, 13.663688505193104],
+  [100.56348731708873, 13.658017128434436],
+  [100.5562775392567, 13.656682667016996],
+  [100.55318763447154, 13.659017969541253],
+  [100.54735114765514, 13.661686858387933],
+  [100.54340293598521, 13.662687683915312],
+  [100.53945472431529, 13.663021291480105],
+  [100.53945472431529, 13.66802534828326],
+  [100.54735114765514, 13.670360538422756],
+  [100.5511276979481, 13.676532000920444],
+  [100.55387427997935, 13.683870826846535],
+  [100.55387427997935, 13.691376207547613],
+  [100.55318763447154, 13.69804745599886],
+  [100.55301597309459, 13.70271721727301],
+  [100.55765083027232, 13.705052063112982]
+]);
+
+var bangKrachao = ee.FeatureCollection(geometry);
+
+// Load Landsat 8 Surface Reflectance data
+var landsat8Sr = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2');
+
+// Function to mask clouds and add variables
+var maskL8sr = function(image) {
+  var qaMask = image.select('QA_PIXEL').bitwiseAnd(parseInt('11111', 2)).eq(0);
+  var saturationMask = image.select('QA_RADSAT').eq(0);
+  var opticalBands = image.select('SR_B.').multiply(0.0000275).add(-0.2);
+  var thermalBands = image.select('ST_B.*').multiply(0.00341802).add(149.0);
+  return image.addBands(opticalBands, null, true)
+    .addBands(thermalBands, null, true)
+    .updateMask(qaMask)
+    .updateMask(saturationMask);
+};
+
+var addVariables = function(image) {
+  var date = image.date();
+  var years = date.difference(ee.Date('1970-01-01'), 'year');
+  return image
+    .addBands(image.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI'))
+    .addBands(ee.Image(years).rename('t')).float()
+    .addBands(ee.Image.constant(1));
+};
+
+// Set the start and end years for analysis
+var startYear = 2019;
+var endYear = 2023;
+
+// Calculate NDVI for start and end years
+var startNDVI = landsat8Sr
+  .filterDate(startYear + '-01-01', (startYear + 1) + '-01-01')
+  .filterBounds(bangKrachao)
+  .map(maskL8sr)
+  .map(addVariables)
+  .select('NDVI')
+  .mean();
+
+var endNDVI = landsat8Sr
+  .filterDate(endYear + '-01-01', (endYear + 1) + '-01-01')
+  .filterBounds(bangKrachao)
+  .map(maskL8sr)
+  .map(addVariables)
+  .select('NDVI')
+  .mean();
+
+// Calculate NDVI change
+var ndviChange = endNDVI.subtract(startNDVI);
+
+// Calculate statistics for NDVI change
+var changeStats = ndviChange.reduceRegion({
+  reducer: ee.Reducer.mean()
+    .combine({reducer2: ee.Reducer.median(), sharedInputs: true})
+    .combine({reducer2: ee.Reducer.percentile([5, 25, 75, 95]), sharedInputs: true}),
+  geometry: bangKrachao,
+  scale: 30,
+  maxPixels: 1e9
+});
+
+// Display NDVI change statistics
+print('NDVI Change Mean:', changeStats.get('NDVI_mean'));
+print('NDVI Change Median:', changeStats.get('NDVI_median'));
+print('NDVI Change 5th Percentile:', changeStats.get('NDVI_p5'));
+print('NDVI Change 25th Percentile:', changeStats.get('NDVI_p25'));
+print('NDVI Change 75th Percentile:', changeStats.get('NDVI_p75'));
+print('NDVI Change 95th Percentile:', changeStats.get('NDVI_p95'));
+
+// Create histogram of NDVI changes
+var changeHistogram = ui.Chart.image.histogram({
+  image: ndviChange,
+  region: bangKrachao,
+  scale: 30,
+  maxPixels: 1e9
+}).setOptions({
+  title: 'Distribution of NDVI Changes in Bang Krachao from 2019 to 2023',
+  hAxis: {title: 'NDVI Change'},
+  vAxis: {title: 'Frequency'}
+});
+print(changeHistogram);
+
+// Identify significant changes (greater than 95th percentile or less than 5th percentile)
+var significantPositiveChange = ndviChange.gt(ee.Number(changeStats.get('NDVI_p95')));
+var significantNegativeChange = ndviChange.lt(ee.Number(changeStats.get('NDVI_p5')));
+
+// Combine significant changes
+var significantChange = significantPositiveChange.multiply(2).add(significantNegativeChange);
+
+// Add layers to the map
+Map.centerObject(bangKrachao, 14);
+
+Map.addLayer(significantChange.updateMask(significantChange), 
+  {min: 1, max: 2, palette: ['red', 'green']}, 
+  'Significant Change Areas (Red: Decrease, Green: Increase)');
+
+// Calculate Getis-Ord Gi* statistic
+var neighborhoodSize = ee.Number(5);
+var kernelWeight = ee.Kernel.square(neighborhoodSize, 'pixels', false);
+
+var localMean = ndviChange.reduceNeighborhood({
+  reducer: ee.Reducer.mean(),
+  kernel: kernelWeight
+});
+
+var localStdDev = ndviChange.reduceNeighborhood({
+  reducer: ee.Reducer.stdDev(),
+  kernel: kernelWeight
+});
+
+var globalMean = ee.Number(changeStats.get('NDVI_mean'));
+var globalStdDev = ee.Number(ndviChange.reduceRegion({
+  reducer: ee.Reducer.stdDev(),
+  geometry: bangKrachao,
+  scale: 30,
+  maxPixels: 1e9
+}).get('NDVI'));
